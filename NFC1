@@ -1,1 +1,284 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <Wire.h>
+#include <Adafruit_PN532.h>
+#include <LiquidCrystal_I2C.h>
+#include <Keypad.h>
+#include <WiFiManager.h> //ไลบารี่จัดการไวไฟ
 
+WiFiManager wm ;
+
+// กำหนดข้อมูล WiFi และ MQTT
+const char* ssid = "CEDC_WiFi_IoT";       
+const char* password = "KMITLPCC68"; 
+const char* mqtt_server = "192.168.70.8";  
+
+unsigned long lastMqttReconnectAttempt = 0;
+const long mqttReconnectInterval = 2000; // 2 seconds
+
+unsigned long uidReadTime = 0;
+const long pinEntryTimeout = 15000; // 15 seconds
+
+IPAddress server(192, 168, 70, 8);
+
+void callback(char* topic, byte* payload, unsigned int length);
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// กำหนดขา SDA และ SCL สำหรับ NFC
+#define SDA_PIN 21
+#define SCL_PIN 22
+
+// กำหนดขา SDA และ SCL สำหรับ LCD
+#define SDA_PIN_LCD 21
+#define SCL_PIN_LCD 22
+
+Adafruit_PN532 nfc(SDA_PIN, SCL_PIN);
+
+// กำหนด LCD I2C
+LiquidCrystal_I2C lcd(0x27, 16, 2); // I2C address 0x27, 16 columns, 2 rows
+
+// ขนาดของ Keypad (4x4 หรือ 4x3)
+const byte ROWS = 4;
+const byte COLS = 4; 
+
+// กำหนดปุ่มบน Keypad 4x4
+char keys[ROWS][COLS] = {
+  {'1', '2', '3', 'A'},
+  {'4', '5', '6', 'B'},
+  {'7', '8', '9', 'C'},
+  {'*', '0', '#', 'D'}
+};
+
+// กำหนดขาเชื่อมต่อระหว่าง Keypad กับ ESP32
+byte rowPins[ROWS] = {26, 25, 33, 32};  // ขา R1, R2, R3, R4
+byte colPins[COLS] = {13, 12, 14, 27};  // ขา C1, C2, C3, C4
+
+// สร้าง Object Keypad
+Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+
+String pinCode = "";
+const int maxPinLength = 6; // จำกัด PIN 6 หลัก
+
+String uidString = ""; // RFID
+String Input_String = "";
+String student_id, status = "";
+
+int testsignal = 0;
+int signal_in = 0;
+
+void setup_wifi() {
+  Serial.print("Connecting to WiFi...");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print("...");
+  }
+  Serial.println("\nWiFi connected!");
+}
+
+void reconnect_mqtt() {
+  while (!client.connected()) {
+    Serial.print("Connecting to MQTT...");
+    char clientId[20];
+    sprintf(clientId, "ESP32_Client_%d", random(1000, 9999)); // สร้าง client ID แบบสุ่ม
+    if (client.connect(clientId)) {
+      Serial.println("connected!");
+      client.subscribe("nfcout1",0);
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" retrying in 5 seconds...");
+      delay(5000);
+    }
+  }
+}
+
+void entry_pin (){
+  while (uidString != ""){
+    char key = keypad.getKey(); // รับค่าจาก Keypad
+    if (key) { // ถ้ามีการกดปุ่ม
+      Serial.println(key);
+      if (key == '#') {  // ล้างค่า PIN
+        pinCode = "";
+        lcd.clear();
+        lcd.setCursor(4, 0);
+        lcd.print("Enter PIN:");
+      }
+      else if (key == '*'){
+        // ส่ง UID ไปยัง MQTT Topic
+        String message = uidString + "|" + pinCode;  // สร้างข้อความ UID + "|" + pinCode
+        if (client.publish("nfcin1", message.c_str())) {
+          Serial.println("Sent to MQTT: " + message);
+
+        }
+        else {
+          Serial.println("MQTT Publish Failed!");
+        }
+        uidString = "";
+        pinCode = ""; // รีเซ็ต PIN หลังจากยืนยัน
+      }
+      else { // บันทึกค่าที่กดและแสดงเป็น "*"
+        if (pinCode.length() < maxPinLength) { // จำกัดความยาว PIN
+          pinCode += key; // บันทึกค่า PIN จริง
+          lcd.setCursor(4 + pinCode.length() - 1, 1); // จัดตำแหน่งให้ต่อกัน
+          lcd.print("*"); // แสดงเป็นดอกจันแทนตัวเลข
+        }
+      }
+    }
+    if (millis() - uidReadTime > pinEntryTimeout) {
+    uidString = "";
+    pinCode = "";
+    lcd.clear();
+    lcd.setCursor(5, 0);
+    lcd.print("Timeout");
+    delay(2000);
+    lcd.clear();
+    lcd.setCursor(5, 0);
+    lcd.print("Welcome");
+    lcd.setCursor(4, 1);
+    lcd.print("KMITL PCC");
+    }
+  }
+}
+
+void readNFC() {
+  uint8_t uid[7] = {0}; // Buffer สำหรับเก็บ UID
+  uint8_t uidLength;
+
+  // ตรวจสอบว่ามีแท็ก NFC อยู่ใกล้หรือไม่
+  if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength,2000)) {
+    Serial.print("Found NFC tag with UID: ");
+    
+    for (uint8_t i = 0; i < uidLength; i++) {
+      Serial.printf("%02X ", uid[i]); // แสดงค่า UID เป็น HEX
+      uidString += String(uid[i], HEX);
+    }
+    Serial.println();
+    lcd.clear();
+    lcd.setCursor(4, 0);
+    lcd.print("Enter PIN:");
+  }
+}
+
+void callback(char* topic, byte* payload, unsigned int length) {
+  Input_String = "";
+  student_id = "";        
+  status = "";
+  Serial.print("Message arrived [");
+  Serial.print(topic);
+  Serial.print("] ");
+  for (int i = 0; i < length; i++) {
+    Serial.print((char)payload[i]);
+    Input_String += (char)payload[i];
+  }
+  Serial.println();
+  Serial.println(Input_String);
+  //checkstatus();
+  status = Input_String.substring(0, 4);      // รับส่วนที่เป็น status
+  student_id = Input_String.substring(5, 13); // รับส่วนที่เป็น student_id
+  Serial.println(status); 
+  Serial.println(student_id);
+  // หากสถานะไม่ใช่ "pass" ให้ปรับสถานะเป็น "notpass"
+  if (status != "pass") {
+    status = "notpass";
+    student_id = Input_String.substring(8, 16); // หากไม่ได้ pass ก็ให้ใช้ student_id ที่ใหม่
+  }
+  // แสดง student_id และ status บน LCD
+  Serial.println(status); 
+  Serial.println(student_id); 
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("ID: " + student_id);  // แสดง student_id
+  lcd.setCursor(0, 1);
+  lcd.print("Status: " + status);  // แสดง status
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(26,INPUT);
+  pinMode(25,INPUT);
+  pinMode(33,INPUT);
+  pinMode(32,INPUT);
+  pinMode(13,INPUT);
+  pinMode(12,INPUT);
+  pinMode(14,INPUT);
+  pinMode(27,INPUT);
+  if(wm.autoConnect("WiFi_NFC_ESP32_1")){ //ถ้ามีการเชื่อมต่อไวไฟจะทำงานตามเงื่อนไข
+    Serial.print(""); //เว้นบรรทัด
+    Serial.println("Connected already WiFi :") ; //แสดงข้อความ Connected already WiFi : ออกซีเรียลมอนิเตอร์
+    Serial.print("IP Address :") ; //แสดงข้อความ IP Address : ออกซีเรียลมอนิเตอร์
+    Serial.println(WiFi.localIP());  //แสดงเลขไอพีแอดแดรส ออกซีเรียลมอนิเตอร์   
+  }
+  else{ //หากไม่มีการเชื่อมต่อ WiFi จะแสดงข้อความ Failed to connect WiFi และ Restart Esp8266
+    Serial.println("Failed to connect WiFi") ; //แสดงข้อความ Failed to connect WiFi ออกซีเรียลมอนิเตอร์
+    delay(1000) ; //หน่วงเวลา 1 วินาที
+    ESP.restart() ; //รีสตาร์ท NodeMcu ESP8266 
+  }
+  Wire.begin(SDA_PIN_LCD, SCL_PIN_LCD);  // ใช้ขา LCD สำหรับ SDA และ SCL
+  // ตั้งค่า WiFi และ MQTT
+  //setup_wifi();
+  client.setBufferSize(512);      
+  client.setServer(mqtt_server, 1883);  
+  client.setCallback(callback);  // ตั้ง callback function ที่ใช้ในการรับข้อมูล MQTT
+  // เริ่มต้นการทำงานของ LCD
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(5, 0);
+  lcd.print("Welcome");
+  lcd.setCursor(4, 1);
+  lcd.print("KMITL PCC");
+
+  // เริ่มต้น NFC
+  Serial.println("Initializing NFC...");
+  nfc.begin();
+
+  uint32_t versiondata = nfc.getFirmwareVersion();
+  if (!versiondata) {
+    Serial.println("Didn't find PN532 board");
+    while (1);
+  }
+
+  Serial.println("Found PN532!");
+  nfc.SAMConfig();
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+  // Periodic connection check
+  if (currentMillis - lastMqttReconnectAttempt > mqttReconnectInterval) {
+    lastMqttReconnectAttempt = currentMillis;
+    if (!client.connected()) {
+      reconnect_mqtt();
+    } else {
+      // Send a ping message to keep connection alive
+      client.publish("nfctest", "alive");
+    }
+    client.loop();  // รัน MQTT Client
+
+    if (uidString == "") {
+      readNFC();
+      if (uidString != "") {
+        uidReadTime = millis(); // Record when UID was read
+        entry_pin();
+      }
+    } 
+    else {
+    // Check for timeout
+      if (millis() - uidReadTime > pinEntryTimeout) {
+        uidString = "";
+        pinCode = "";
+        lcd.clear();
+        lcd.setCursor(5, 0);
+        lcd.print("Timeout");
+        delay(2000);
+        lcd.clear();
+        lcd.setCursor(5, 0);
+        lcd.print("Welcome");
+        lcd.setCursor(4, 1);
+        lcd.print("KMITL PCC");
+      }
+    }
+  }
+}
